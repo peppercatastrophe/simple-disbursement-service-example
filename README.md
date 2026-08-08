@@ -1,6 +1,6 @@
 # simple-disbursement-service-example
 
-Disbursement API service built as the take-home backend test for the Senior Backend Engineer role.
+Disbursement API service built as the take-home backend test for the Backend Engineer role.
 
 Layered Go application (`handler → service → repository → model`) exposing a JWT-protected disbursement API with idempotency, concurrency-safe status transitions, soft delete, and a non-blocking audit log.
 
