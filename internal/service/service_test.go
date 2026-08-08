@@ -24,12 +24,14 @@ type fakeDisbursementRepo struct {
 	mu     sync.Mutex
 	rows   map[int64]*model.Disbursement
 	nextID int64
+	// idemKeys maps an idempotency key to the disbursement created for it.
+	idemKeys map[string]*model.Disbursement
 	// updateStatusOverride, when set, replaces the default guarded transition.
 	updateStatusOverride func(d *model.Disbursement, from model.DisbursementStatus) (int64, error)
 }
 
 func newFakeDisbursementRepo() *fakeDisbursementRepo {
-	return &fakeDisbursementRepo{rows: map[int64]*model.Disbursement{}}
+	return &fakeDisbursementRepo{rows: map[int64]*model.Disbursement{}, idemKeys: map[string]*model.Disbursement{}}
 }
 
 func (f *fakeDisbursementRepo) seed(d *model.Disbursement) {
@@ -94,7 +96,20 @@ func (f *fakeDisbursementRepo) List(context.Context, repository.ListFilter) ([]m
 }
 
 func (f *fakeDisbursementRepo) CreateIdempotent(_ context.Context, key string, d *model.Disbursement) (*model.Disbursement, bool, error) {
-	return nil, false, errors.New("not implemented in fake")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// Replay: the key was already used; return the original, no new row.
+	if existing, ok := f.idemKeys[key]; ok {
+		cp := *existing
+		return &cp, true, nil
+	}
+	// First use: create a fresh row and record it against the key.
+	f.nextID++
+	d.ID = f.nextID
+	cp := *d
+	f.rows[d.ID] = &cp
+	f.idemKeys[key] = &cp
+	return &cp, false, nil
 }
 
 // fakeAuditRepo implements repository.AuditLogRepository, capturing entries.
@@ -421,4 +436,202 @@ func TestUpdateStatusConcurrentApprove(t *testing.T) {
 	if got.Status != model.StatusApproved {
 		t.Errorf("final status = %s, want APPROVED", got.Status)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// NewDisbursement.Validate
+// ---------------------------------------------------------------------------
+
+func TestNewDisbursementValidate(t *testing.T) {
+	valid := NewDisbursement{
+		RecipientName: "Budi Santoso",
+		AccountNumber: "1234567890",
+		BankCode:      "BCA",
+		Amount:        1_250_000,
+		Note:          "Pembayaran supplier",
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*NewDisbursement)
+		want   string // expected error substring; empty means valid
+	}{
+		{"valid", func(*NewDisbursement) {}, ""},
+		{"valid without note", func(n *NewDisbursement) { n.Note = "" }, ""},
+		{"valid at minimum amount", func(n *NewDisbursement) { n.Amount = 10000 }, ""},
+		{"missing recipient_name", func(n *NewDisbursement) { n.RecipientName = "" }, "recipient_name is required"},
+		{"missing account_number", func(n *NewDisbursement) { n.AccountNumber = "" }, "account_number is required"},
+		{"missing bank_code", func(n *NewDisbursement) { n.BankCode = "" }, "bank_code is required"},
+		{"amount zero", func(n *NewDisbursement) { n.Amount = 0 }, "at least 10000"},
+		{"amount one below minimum", func(n *NewDisbursement) { n.Amount = 9999 }, "at least 10000"},
+		{"amount negative", func(n *NewDisbursement) { n.Amount = -100 }, "at least 10000"},
+		{"all fields empty", func(n *NewDisbursement) { *n = NewDisbursement{} }, "recipient_name is required"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := valid
+			tt.mutate(&in)
+			err := in.Validate()
+			if tt.want == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Validate() error = %v, want containing %q", err, tt.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Create (idempotency)
+// ---------------------------------------------------------------------------
+
+func TestCreateIdempotency(t *testing.T) {
+	actor := adminActor(7)
+	in := NewDisbursement{
+		RecipientName: "Budi Santoso",
+		AccountNumber: "1234567890",
+		BankCode:      "BCA",
+		Amount:        1_250_000,
+		Note:          "Pembayaran supplier",
+	}
+
+	t.Run("first request creates, replay returns identical without side effects", func(t *testing.T) {
+		svc, _, audit := newDisbService(t)
+		const key = "550e8400-e29b-41d4-a716-446655440000"
+
+		first, replayed, err := svc.Create(context.Background(), actor, in, key)
+		if err != nil {
+			t.Fatalf("first Create() error: %v", err)
+		}
+		if replayed {
+			t.Fatalf("first Create() replayed = true, want false")
+		}
+		if first.ID == 0 {
+			t.Fatal("first Create() did not assign an id")
+		}
+
+		second, replayed, err := svc.Create(context.Background(), actor, in, key)
+		if err != nil {
+			t.Fatalf("replay Create() error: %v", err)
+		}
+		if !replayed {
+			t.Fatal("replay Create() replayed = false, want true")
+		}
+		// Identical response: same id, same computed fee.
+		if second.ID != first.ID {
+			t.Errorf("replay id = %d, want %d (identical response)", second.ID, first.ID)
+		}
+		if second.AdminFee != first.AdminFee {
+			t.Errorf("replay admin_fee = %d, want %d", second.AdminFee, first.AdminFee)
+		}
+		if second.Status != model.StatusPending {
+			t.Errorf("replay status = %s, want PENDING", second.Status)
+		}
+
+		// No duplicate rows created.
+		got, err := svc.repo.FindByID(context.Background(), first.ID)
+		if err != nil {
+			t.Fatalf("FindByID: %v", err)
+		}
+		if got.ID != first.ID {
+			t.Errorf("stored id = %d, want %d", got.ID, first.ID)
+		}
+
+		// Exactly one audit entry (replay must not re-audit).
+		audit.mu.Lock()
+		defer audit.mu.Unlock()
+		if len(audit.entries) != 1 {
+			t.Errorf("audit entries = %d, want 1 (replay must not re-audit)", len(audit.entries))
+		}
+	})
+
+	t.Run("distinct keys create distinct disbursements", func(t *testing.T) {
+		svc, _, _ := newDisbService(t)
+		a, _, err := svc.Create(context.Background(), actor, in, "key-a")
+		if err != nil {
+			t.Fatalf("Create key-a error: %v", err)
+		}
+		b, replayed, err := svc.Create(context.Background(), actor, in, "key-b")
+		if err != nil {
+			t.Fatalf("Create key-b error: %v", err)
+		}
+		if replayed {
+			t.Fatalf("distinct key replayed = true, want false")
+		}
+		if a.ID == b.ID {
+			t.Errorf("distinct keys share id %d, want distinct rows", a.ID)
+		}
+	})
+
+	t.Run("no key uses plain create path", func(t *testing.T) {
+		svc, _, audit := newDisbService(t)
+		d, replayed, err := svc.Create(context.Background(), actor, in, "")
+		if err != nil {
+			t.Fatalf("Create() error: %v", err)
+		}
+		if replayed {
+			t.Fatal("no-key Create() replayed = true, want false")
+		}
+		if d.ID == 0 {
+			t.Fatal("no-key Create() did not assign an id")
+		}
+		audit.mu.Lock()
+		defer audit.mu.Unlock()
+		if len(audit.entries) != 1 {
+			t.Errorf("audit entries = %d, want 1", len(audit.entries))
+		}
+	})
+
+	t.Run("invalid input is rejected before any idempotency side effect", func(t *testing.T) {
+		svc, _, audit := newDisbService(t)
+		bad := NewDisbursement{RecipientName: "", Amount: 999} // invalid
+		_, _, err := svc.Create(context.Background(), actor, bad, "key-invalid")
+		if err == nil {
+			t.Fatal("expected validation error")
+		}
+		audit.mu.Lock()
+		defer audit.mu.Unlock()
+		if len(audit.entries) != 0 {
+			t.Errorf("audit entries = %d, want 0 on validation failure", len(audit.entries))
+		}
+	})
+
+	t.Run("replay returns the stored disbursement unchanged by later state changes", func(t *testing.T) {
+		svc, repo, _ := newDisbService(t)
+		const key = "replay-after-transition"
+		created, _, err := svc.Create(context.Background(), actor, in, key)
+		if err != nil {
+			t.Fatalf("Create() error: %v", err)
+		}
+
+		// Transition the stored row, then replay the key.
+		row, err := repo.FindByID(context.Background(), created.ID)
+		if err != nil {
+			t.Fatalf("FindByID: %v", err)
+		}
+		row.Status = model.StatusApproved
+		if _, err := svc.repo.UpdateStatus(context.Background(), row, model.StatusPending); err != nil {
+			t.Fatalf("UpdateStatus: %v", err)
+		}
+
+		replayed, isReplay, err := svc.Create(context.Background(), actor, in, key)
+		if err != nil {
+			t.Fatalf("replay Create() error: %v", err)
+		}
+		if !isReplay {
+			t.Fatal("expected replay")
+		}
+		// Replay must reflect the current stored state, not fabricate a new row.
+		if replayed.Status != model.StatusApproved {
+			t.Errorf("replay status = %s, want APPROVED (reflects stored state)", replayed.Status)
+		}
+		if replayed.ID != created.ID {
+			t.Errorf("replay id = %d, want %d", replayed.ID, created.ID)
+		}
+	})
 }
